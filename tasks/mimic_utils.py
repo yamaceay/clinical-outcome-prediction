@@ -2,6 +2,7 @@ import argparse
 
 import pandas as pd
 import os
+import re
 import csv
 
 
@@ -54,34 +55,96 @@ def filter_notes(notes_df: pd.DataFrame, admissions_df: pd.DataFrame, admission_
     return notes_df
 
 
-def filter_admission_text(notes_df) -> pd.DataFrame:
+def _norm_header(s: str) -> str:
+    # normalize header for matching: lowercase, collapse spaces, remove trailing colon
+    s = s.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    s = s[:-1] if s.endswith(":") else s
+    return s
+
+def build_header_map(admission_sections: dict[str, str], extra_variants: dict[str, list[str]] | None = None):
     """
-    Filter text information by section and only keep sections that are known on admission time.
+    admission_sections: {CANON_KEY: "Chief Complaint:"}
+    extra_variants: {CANON_KEY: ["CC:", "CHIEF COMPLAINT", ...]}
+    returns: normalized_header -> CANON_KEY
+    """
+    header_map = {}
+    for canon_key, header in admission_sections.items():
+        header_map[_norm_header(header)] = canon_key
+        header_map[_norm_header(header.rstrip(":"))] = canon_key
+
+    if extra_variants:
+        for canon_key, variants in extra_variants.items():
+            for v in variants:
+                header_map[_norm_header(v)] = canon_key
+                header_map[_norm_header(v.rstrip(":"))] = canon_key
+
+    return header_map
+
+def extract_sections(note_text: str, header_map: dict[str, str]) -> dict[str, str]:
+    """
+    Find headers as standalone lines, slice content between successive headers.
+    """
+    header_line_re = re.compile(r"(?m)^(?P<h>[A-Za-z][A-Za-z0-9 /&\-\(\)\[\]]{0,60}?):?\s*$")
+
+    matches = []
+    for m in header_line_re.finditer(note_text):
+        raw = m.group("h")
+        canon = header_map.get(_norm_header(raw))
+        if canon:
+            matches.append((canon, m.start(), m.end()))  # start/end of header line
+
+    if not matches:
+        return {}
+
+    # De-dupe: if same canon appears multiple times, you can choose first, last, or concat.
+    # Besides: We'll concat with "\n\n" in order to stick to the original structure.
+    out = {}
+    for idx, (canon, h_start, h_end) in enumerate(matches):
+        content_start = h_end
+        content_end = matches[idx + 1][1] if idx + 1 < len(matches) else len(note_text)
+        content = note_text[content_start:content_end].strip()
+
+        if canon in out and content:
+            out[canon] = (out[canon].rstrip() + "\n\n" + content)
+        elif content:
+            out[canon] = content
+        else:
+            out.setdefault(canon, "")
+
+    return out
+
+
+def filter_admission_text(notes_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract only the sections of the discharge summary that are known at admission time.
     """
     admission_sections = {
-        "CHIEF_COMPLAINT": "chief complaint:",
-        "PRESENT_ILLNESS": "present illness:",
-        "MEDICAL_HISTORY": "medical history:",
-        "MEDICATION_ADM": "medications on admission:",
-        "ALLERGIES": "allergies:",
-        "PHYSICAL_EXAM": "physical exam:",
-        "FAMILY_HISTORY": "family history:",
-        "SOCIAL_HISTORY": "social history:"
+        "CHIEF_COMPLAINT": "Chief Complaint:",
+        "PRESENT_ILLNESS": "History of Present Illness:",
+        "MEDICAL_HISTORY": "Past Medical History:",
+        "MEDICATION_ADM": "Medications on Admission:",
+        "ALLERGIES": "Allergies:",
+        "PHYSICAL_EXAM": "Physical Exam:",
+        "FAMILY_HISTORY": "Family History:",
+        "SOCIAL_HISTORY": "Social History:"
     }
 
-    # replace linebreak indicators
-    notes_df['TEXT'] = notes_df['TEXT'].str.replace(r"\n", r"\\n")
+    extra_variants = {
+        "PRESENT_ILLNESS": ["Present Illness", "HPI", "History Present Illness"],
+        "MEDICAL_HISTORY": ["PMH", "Medical History"],
+        "MEDICATION_ADM": ["Home Medications", "Medications"],
+    }
 
-    # extract each section by regex
+    header_map = build_header_map(admission_sections, extra_variants)
+
     for key in admission_sections.keys():
-        section = admission_sections[key]
-        notes_df[key] = notes_df.TEXT.str.extract(r'(?i){}(.+?)\\n\\n[^(\\|\d|\.)]+?:'
-                                                  .format(section))
+        notes_df[key] = ""
 
-        notes_df[key] = notes_df[key].str.replace(r'\\n', r' ')
-        notes_df[key] = notes_df[key].str.strip()
-        notes_df[key] = notes_df[key].fillna("")
-        notes_df[notes_df[key].str.startswith("[]")][key] = ""
+    for i, x in enumerate(notes_df["TEXT"]):
+        sec = extract_sections(x, header_map)
+        for k, v in sec.items():
+            notes_df.at[i, k] = v
 
     # filter notes with missing main information
     notes_df = notes_df[(notes_df.CHIEF_COMPLAINT != "") | (notes_df.PRESENT_ILLNESS != "") |
